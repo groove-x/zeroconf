@@ -2,9 +2,13 @@ package zeroconf
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net"
+	"os"
+	"os/user"
+	"path/filepath"
 	"strings"
 
 	"golang.org/x/net/ipv4"
@@ -32,6 +36,8 @@ const (
 type clientOpts struct {
 	listenOn IPType
 	ifaces   []net.Interface
+
+	cacheFilePath string
 }
 
 // ClientOption fills the option struct to configure intefaces, etc.
@@ -52,6 +58,12 @@ func SelectIPTraffic(t IPType) ClientOption {
 func SelectIfaces(ifaces []net.Interface) ClientOption {
 	return func(o *clientOpts) {
 		o.ifaces = ifaces
+	}
+}
+
+func CacheFile(path string) ClientOption {
+	return func(o *clientOpts) {
+		o.cacheFilePath = path
 	}
 }
 
@@ -90,40 +102,19 @@ func (r *Resolver) Browse(ctx context.Context, service, domain string, entries c
 	}
 	params.Entries = entries
 	ctx, cancel := context.WithCancel(ctx)
-	go r.c.mainloop(ctx, params)
 
-	err := r.c.query(params)
-	if err != nil {
-		cancel()
-		return err
-	}
-	// If previous probe was ok, it should be fine now. In case of an error later on,
-	// the entries' queue is closed.
+	params.instances = loadCache(r.c.cacheFilePath)
+
 	go func() {
-		if err := r.c.periodicQuery(ctx, params); err != nil {
-			cancel()
-		}
+		r.c.mainloop(ctx, params)
+		saveCache(r.c.cacheFilePath, params.instances)
 	}()
 
-	return nil
-}
-
-// Lookup a specific service by its name and type in a given domain.
-func (r *Resolver) Lookup(ctx context.Context, instance, service, domain string, entries chan<- *ServiceEntry) error {
-	params := defaultParams(service)
-	params.Instance = instance
-	if domain != "" {
-		params.Domain = domain
-	}
-	params.Entries = entries
-	ctx, cancel := context.WithCancel(ctx)
-	go r.c.mainloop(ctx, params)
-	err := r.c.query(params)
-	if err != nil {
-		// cancel mainloop
+	if err := r.c.query(params); err != nil {
 		cancel()
 		return err
 	}
+
 	// If previous probe was ok, it should be fine now. In case of an error later on,
 	// the entries' queue is closed.
 	go func() {
@@ -145,6 +136,8 @@ type client struct {
 	ipv4conn *ipv4.PacketConn
 	ipv6conn *ipv6.PacketConn
 	ifaces   []net.Interface
+
+	cacheFilePath string
 }
 
 // Client structure constructor
@@ -172,11 +165,54 @@ func newClient(opts clientOpts) (*client, error) {
 		}
 	}
 
+	cacheFilePath := opts.cacheFilePath
+	if opts.cacheFilePath == "" {
+		var base string
+		u, err := user.Current()
+		if err == nil {
+			base = u.HomeDir
+		} else {
+			base = os.TempDir()
+		}
+		cacheFilePath = filepath.Join(base, "/.mdns.cache")
+	}
+
 	return &client{
 		ipv4conn: ipv4conn,
 		ipv6conn: ipv6conn,
 		ifaces:   ifaces,
+
+		cacheFilePath: cacheFilePath,
 	}, nil
+}
+
+func loadCache(cachePath string) map[string]*cacheEntry {
+	var cache map[string]*cacheEntry
+	f, err := os.Open(cachePath)
+	if err != nil {
+		return make(map[string]*cacheEntry)
+	}
+	defer f.Close()
+	if err := json.NewDecoder(f).Decode(&cache); err != nil {
+		return make(map[string]*cacheEntry)
+	}
+
+	now := time.Now()
+	for name, entry := range cache {
+		if now.Sub(entry.ExpireTime) > 0 {
+			delete(cache, name)
+		}
+	}
+	return cache
+}
+
+func saveCache(cachePath string, cache map[string]*cacheEntry) {
+	f, err := os.OpenFile(cachePath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0644)
+	if err != nil {
+		return
+	}
+	json.NewEncoder(f).Encode(cache)
+	f.Close()
 }
 
 // Start listeners and waits for the shutdown signal from exit channel
@@ -281,6 +317,7 @@ func (c *client) mainloop(ctx context.Context, params *LookupParams) {
 				if _, ok := sentEntries[k]; ok {
 					continue
 				}
+				params.instances[k] = &cacheEntry{ExpireTime: time.Now().Add(72 * time.Hour)}
 
 				// If this is an DNS-SD query do not throw PTR away.
 				// It is expected to have only PTR for enumeration
@@ -301,6 +338,7 @@ func (c *client) mainloop(ctx context.Context, params *LookupParams) {
 			// reset entries
 			entries = make(map[string]*ServiceEntry)
 		}
+		saveCache(c.cacheFilePath, params.instances)
 	}
 }
 
@@ -406,31 +444,33 @@ func (c *client) periodicQuery(ctx context.Context, params *LookupParams) error 
 
 }
 
-// Performs the actual query by service name (browse) or service instance name (lookup),
+// Performs the actual query by service name (browse) and cached service instance name (lookup),
 // start response listeners goroutines and loops over the entries channel.
 func (c *client) query(params *LookupParams) error {
-	var serviceName, serviceInstanceName string
-	serviceName = fmt.Sprintf("%s.%s.", trimDot(params.Service), trimDot(params.Domain))
-	if params.Instance != "" {
-		serviceInstanceName = fmt.Sprintf("%s.%s", params.Instance, serviceName)
-	}
+	serviceName := fmt.Sprintf("%s.%s.", trimDot(params.Service), trimDot(params.Domain))
 
-	// send the query
 	m := new(dns.Msg)
-	if serviceInstanceName != "" {
-		m.Question = []dns.Question{
-			dns.Question{serviceInstanceName, dns.TypeSRV, dns.ClassINET},
-			dns.Question{serviceInstanceName, dns.TypeTXT, dns.ClassINET},
+	m.Question = append(m.Question, dns.Question{serviceName, dns.TypePTR, dns.ClassINET})
+
+	var i int = 0
+	for name, _ := range params.instances {
+		if !strings.HasSuffix(name, serviceName) {
+			continue
 		}
-		m.RecursionDesired = false
-	} else {
-		m.SetQuestion(serviceName, dns.TypePTR)
-		m.RecursionDesired = false
+		i++
+		if i == 15 {
+			i = 0
+			if err := c.sendQuery(m); err != nil {
+				return err
+			}
+			m = new(dns.Msg)
+		}
+		m.Question = append(m.Question, dns.Question{name, dns.TypeSRV, dns.ClassINET})
+		m.Question = append(m.Question, dns.Question{name, dns.TypeTXT, dns.ClassINET})
 	}
 	if err := c.sendQuery(m); err != nil {
 		return err
 	}
-
 	return nil
 }
 

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"time"
 )
 
 // ServiceRecord contains the basic description of a service, which contains instance name, service type & domain
@@ -64,6 +65,8 @@ type LookupParams struct {
 	ServiceRecord
 	Entries chan<- *ServiceEntry // Entries Channel
 
+	instances map[string]*cacheEntry // Cached instances
+
 	stopProbing chan struct{}
 	once        sync.Once
 }
@@ -106,4 +109,8 @@ func NewServiceEntry(instance, service, domain string) *ServiceEntry {
 	return &ServiceEntry{
 		ServiceRecord: *NewServiceRecord(instance, service, domain),
 	}
+}
+
+type cacheEntry struct {
+	ExpireTime time.Time `json:"exp"`
 }
