@@ -610,12 +610,6 @@ func (s *Server) appendAddrs(list []dns.RR, ttl uint32, ifIndex int, flushCache 
 			v6 = append(v6, a6...)
 		}
 	}
-	if ttl > 0 {
-		// RFC6762 Section 10 says A/AAAA records SHOULD
-		// use TTL of 120s, to account for network interface
-		// and IP address changes.
-		ttl = 120
-	}
 	var cacheFlushBit uint16
 	if flushCache {
 		cacheFlushBit = qClassCacheFlush
