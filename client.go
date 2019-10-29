@@ -338,7 +338,6 @@ func (c *client) mainloop(ctx context.Context, params *LookupParams) {
 			// reset entries
 			entries = make(map[string]*ServiceEntry)
 		}
-		saveCache(c.cacheFilePath, params.instances)
 	}
 }
 
